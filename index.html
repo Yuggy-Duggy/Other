@@ -1,0 +1,752 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ─────────────────────────────────────────────────────────────────────
+// CRYPTO  ·  Key derived from room code (PBKDF2) → AES-256-GCM
+// No manual key exchange — both peers share the room code
+// ─────────────────────────────────────────────────────────────────────
+const SC = window.crypto.subtle;
+const rnd = n => window.crypto.getRandomValues(new Uint8Array(n));
+const enc64 = a => btoa(String.fromCharCode(...new Uint8Array(a)));
+const dec64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+const deriveKey = async (code) => {
+  const raw = await SC.importKey(
+    "raw", new TextEncoder().encode(code.toUpperCase()), "PBKDF2", false, ["deriveKey"]
+  );
+  return SC.deriveKey(
+    { name:"PBKDF2", salt:new TextEncoder().encode("cl-room-salt-v3"),
+      iterations:80000, hash:"SHA-256" },
+    raw, { name:"AES-GCM", length:256 }, false, ["encrypt","decrypt"]
+  );
+};
+const aesEnc = async (key, text) => {
+  const iv = rnd(12);
+  const ct = await SC.encrypt({ name:"AES-GCM", iv }, key, new TextEncoder().encode(text));
+  return enc64(new Uint8Array([...iv, ...new Uint8Array(ct)]));
+};
+const aesDec = async (key, b64) => {
+  const b = dec64(b64);
+  const pt = await SC.decrypt({ name:"AES-GCM", iv:b.slice(0,12) }, key, b.slice(12));
+  return new TextDecoder().decode(pt);
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// WEBRTC
+// ─────────────────────────────────────────────────────────────────────
+const mkPC = () => new RTCPeerConnection({ iceServers:[
+  {urls:"stun:stun.l.google.com:19302"},
+  {urls:"stun:stun1.l.google.com:19302"},
+  {urls:"stun:stun2.l.google.com:19302"},
+]});
+const waitICE = pc => new Promise(res => {
+  if (pc.iceGatheringState==="complete") return res();
+  const h = () => { if(pc.iceGatheringState==="complete"){pc.removeEventListener("icegatheringstatechange",h);res();}};
+  pc.addEventListener("icegatheringstatechange", h);
+  setTimeout(res, 9000);
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// UTILS
+// ─────────────────────────────────────────────────────────────────────
+const VOCAB = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/I/1 lookalikes
+const mkRoom  = () => Array.from(rnd(6)).map(b=>VOCAB[b%32]).join("");
+const mkNode  = () => Array.from(rnd(3)).map(b=>b.toString(16).padStart(2,"0")).join("").toUpperCase();
+const fmtDate = d => {
+  const n = new Date();
+  const same = d.toDateString()===n.toDateString();
+  return same ? d.toTimeString().slice(0,8) : d.toLocaleDateString()+" "+d.toTimeString().slice(0,5);
+};
+const pause   = ms => new Promise(r=>setTimeout(r,ms));
+const STORAGE_PREFIX = "cl3:";
+const MAX_MSG = 500;
+
+// ─────────────────────────────────────────────────────────────────────
+// DESIGN TOKENS
+// ─────────────────────────────────────────────────────────────────────
+const C = {
+  bg:"#06080e", surface:"#0c0f1a", surfaceAlt:"#101420",
+  border:"#1c2340", borderHi:"#2e3d6a",
+  blue:"#4d8eff", blueDim:"#1a3066", blueHi:"#85b3ff",
+  cyan:"#00d4ff", cyanDim:"#004455",
+  green:"#00e676", greenDim:"#00391c",
+  red:"#ff4444", redDim:"#3d0000",
+  white:"#d0deff", muted:"#4a5a80", dim:"#2a3450", sys:"#3a4d70",
+  accent:"#5b7fff",
+};
+const mono = {fontFamily:"'JetBrains Mono','Fira Code','Courier New',monospace"};
+const sans = {fontFamily:"'Inter','Segoe UI',system-ui,sans-serif"};
+
+const pill = (color, bg) => ({
+  display:"inline-flex", alignItems:"center",
+  background:bg, color:color,
+  border:`1px solid ${color}33`,
+  borderRadius:4, padding:"2px 8px",
+  fontSize:9, fontWeight:700, letterSpacing:"0.1em",
+  ...mono,
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// STORAGE HELPERS  (wraps window.storage with try/catch)
+// ─────────────────────────────────────────────────────────────────────
+const stGet = async (key, shared=false) => { try { const r=await window.storage.get(STORAGE_PREFIX+key,shared); return r?.value??null; } catch{return null;} };
+const stSet = async (key, val, shared=false) => { try { await window.storage.set(STORAGE_PREFIX+key,val,shared); } catch{} };
+const stDel = async (key, shared=false) => { try { await window.storage.delete(STORAGE_PREFIX+key,shared); } catch{} };
+
+// ─────────────────────────────────────────────────────────────────────
+// APP
+// ─────────────────────────────────────────────────────────────────────
+export default function CipherLink() {
+  // phases: landing | creating | waiting | joining | chat | error
+  const [phase,       setPhase]       = useState("landing");
+  const [myNode]                      = useState(mkNode);
+  const [roomCode,    setRoomCode]    = useState("");
+  const [roomInput,   setRoomInput]   = useState("");
+  const [peerId,      setPeerId]      = useState("");
+  const [messages,    setMessages]    = useState([]);
+  const [chatIn,      setChatIn]      = useState("");
+  const [connState,   setConnState]   = useState("offline");
+  const [statusLine,  setStatusLine]  = useState("");
+  const [error,       setError]       = useState(null);
+  const [peerTyping,  setPeerTyping]  = useState(false);
+  const [copied,      setCopied]      = useState(false);
+  const [savedRooms,  setSavedRooms]  = useState([]);
+  const [msgCount,    setMsgCount]    = useState(0);
+  const [showHistory, setShowHistory] = useState(false);
+
+  const pcRef   = useRef(null);
+  const dcRef   = useRef(null);
+  const skRef   = useRef(null);
+  const pollRef = useRef(null);
+  const bottom  = useRef(null);
+  const chatRef = useRef(null);
+  const typTmr  = useRef(null);
+  const lastTyp = useRef(0);
+  const roomRef = useRef("");
+
+  // ── Load saved room list on mount ──────────────────────────
+  useEffect(() => {
+    (async () => {
+      const raw = await stGet("room-list");
+      if (raw) {
+        try { setSavedRooms(JSON.parse(raw)); } catch {}
+      }
+    })();
+  }, []);
+
+  // ── Persist message list ───────────────────────────────────
+  const persistMsgs = useCallback(async (msgs, code) => {
+    const toSave = msgs.slice(-MAX_MSG).map(m=>({...m, ts:m.ts.toISOString()}));
+    await stSet(`msgs:${code}`, JSON.stringify(toSave));
+  }, []);
+
+  // ── Add a message ──────────────────────────────────────────
+  const addMsg = useCallback((text, from, extra={}) => {
+    const msg = { id:Math.random().toString(36).slice(2), text, from, ts:new Date(), ...extra };
+    setMessages(prev => {
+      const next = [...prev, msg];
+      if (roomRef.current) persistMsgs(next, roomRef.current);
+      return next;
+    });
+    if (from !== "sys") setMsgCount(n=>n+1);
+  }, [persistMsgs]);
+
+  // ── Save room to list ──────────────────────────────────────
+  const saveRoomToList = useCallback(async (code, role) => {
+    setSavedRooms(prev => {
+      const exists = prev.find(r=>r.code===code);
+      const next = exists
+        ? prev.map(r=>r.code===code?{...r,lastSeen:new Date().toISOString(),role}:r)
+        : [...prev, {code, role, created:new Date().toISOString(), lastSeen:new Date().toISOString()}];
+      stSet("room-list", JSON.stringify(next.slice(-20)));
+      return next;
+    });
+  }, []);
+
+  // ── DataChannel setup ──────────────────────────────────────
+  const setupDC = useCallback((chan) => {
+    dcRef.current = chan;
+    chan.onopen = () => {
+      setConnState("connected");
+      clearInterval(pollRef.current);
+      chan.send(JSON.stringify({t:"hi", id:myNode}));
+      addMsg("Secure channel open · AES-256-GCM encrypted · messages saved locally.", "sys");
+      setPhase("chat");
+      setTimeout(()=>chatRef.current?.focus(), 200);
+    };
+    chan.onclose  = () => { setConnState("disconnected"); addMsg("Peer disconnected.", "sys"); };
+    chan.onerror  = () => { setConnState("error"); };
+    chan.onmessage = async ({data}) => {
+      try {
+        const msg = JSON.parse(data);
+        if (msg.t === "hi") {
+          setPeerId(msg.id);
+        } else if (msg.t === "msg") {
+          const text = await aesDec(skRef.current, msg.d);
+          addMsg(text, "peer");
+          setPeerTyping(false);
+        } else if (msg.t === "typing") {
+          setPeerTyping(true);
+          clearTimeout(typTmr.current);
+          typTmr.current = setTimeout(()=>setPeerTyping(false), 2500);
+        } else if (msg.t === "bye") {
+          addMsg("Peer left the room.", "sys");
+        }
+      } catch {}
+    };
+  }, [myNode, addMsg]);
+
+  // ── CREATE ROOM ────────────────────────────────────────────
+  const createRoom = async () => {
+    setError(null);
+    const code = mkRoom();
+    setRoomCode(code); roomRef.current = code;
+    setPhase("creating"); setStatusLine("Deriving encryption key…");
+
+    try {
+      skRef.current = await deriveKey(code);
+      setStatusLine("Opening WebRTC connection…");
+      const p = mkPC(); pcRef.current = p;
+      const chan = p.createDataChannel("chat", {ordered:true});
+      setupDC(chan);
+
+      await p.setLocalDescription(await p.createOffer());
+      setStatusLine("Collecting network candidates…");
+      await waitICE(p);
+
+      const offer = JSON.stringify({type:p.localDescription.type, sdp:p.localDescription.sdp});
+      await stSet(`room:${code}:offer`, offer, true);
+      await stDel(`room:${code}:answer`, true);
+
+      setPhase("waiting"); setStatusLine("Waiting for peer…");
+      await saveRoomToList(code, "host");
+
+      // Load any saved messages for this room
+      const saved = await stGet(`msgs:${code}`);
+      if (saved) {
+        try {
+          const msgs = JSON.parse(saved).map(m=>({...m, ts:new Date(m.ts)}));
+          setMessages(msgs);
+        } catch {}
+      }
+
+      // Poll for answer
+      pollRef.current = setInterval(async () => {
+        try {
+          const ans = await stGet(`room:${code}:answer`, true);
+          if (ans) {
+            clearInterval(pollRef.current);
+            const desc = JSON.parse(ans);
+            await p.setRemoteDescription(new RTCSessionDescription(desc));
+            setStatusLine("Connecting…");
+          }
+        } catch {}
+      }, 1200);
+
+    } catch(e) { setError(e.message||"Failed to create room."); setPhase("landing"); }
+  };
+
+  // ── JOIN ROOM ──────────────────────────────────────────────
+  const joinRoom = async (overrideCode) => {
+    const code = (overrideCode || roomInput).trim().toUpperCase().replace(/[^A-Z2-9]/g,"");
+    if (code.length < 4) { setError("Enter a valid room code."); return; }
+    setError(null);
+    setRoomCode(code); roomRef.current = code;
+    setPhase("joining"); setStatusLine(`Looking up room ${code}…`);
+
+    try {
+      skRef.current = await deriveKey(code);
+
+      let offer = null;
+      for (let i=0; i<6; i++) {
+        offer = await stGet(`room:${code}:offer`, true);
+        if (offer) break;
+        await pause(1000);
+        setStatusLine(`Searching for room ${code}… (${i+1}/6)`);
+      }
+      if (!offer) { setError(`Room "${code}" not found. Check the code and try again.`); setPhase("landing"); return; }
+
+      const p = mkPC(); pcRef.current = p;
+      p.ondatachannel = ({channel}) => setupDC(channel);
+
+      setStatusLine("Negotiating connection…");
+      await p.setRemoteDescription(new RTCSessionDescription(JSON.parse(offer)));
+      await p.setLocalDescription(await p.createAnswer());
+      setStatusLine("Finalising…");
+      await waitICE(p);
+
+      const answer = JSON.stringify({type:p.localDescription.type, sdp:p.localDescription.sdp});
+      await stSet(`room:${code}:answer`, answer, true);
+      setStatusLine("Waiting for host…");
+      await saveRoomToList(code, "guest");
+
+      // Load saved messages
+      const saved = await stGet(`msgs:${code}`);
+      if (saved) {
+        try {
+          const msgs = JSON.parse(saved).map(m=>({...m, ts:new Date(m.ts)}));
+          setMessages(msgs);
+        } catch {}
+      }
+
+    } catch(e) { setError(e.message||"Failed to join room."); setPhase("landing"); }
+  };
+
+  // ── SEND ──────────────────────────────────────────────────
+  const sendMsg = async () => {
+    const text = chatIn.trim();
+    if (!text || dcRef.current?.readyState !== "open" || !skRef.current) return;
+    setChatIn("");
+    try {
+      const enc = await aesEnc(skRef.current, text);
+      dcRef.current.send(JSON.stringify({t:"msg", d:enc}));
+      addMsg(text, "me");
+    } catch { addMsg("[Send error]","sys"); }
+  };
+
+  const sendTyping = () => {
+    const now = Date.now();
+    if (dcRef.current?.readyState==="open" && now-lastTyp.current>1500) {
+      lastTyp.current = now;
+      dcRef.current.send(JSON.stringify({t:"typing"}));
+    }
+  };
+
+  // ── RESET ─────────────────────────────────────────────────
+  const reset = () => {
+    clearInterval(pollRef.current);
+    try{dcRef.current?.send(JSON.stringify({t:"bye"}));}catch{}
+    try{pcRef.current?.close();}catch{}
+    pcRef.current=dcRef.current=skRef.current=null;
+    setPhase("landing"); setRoomCode(""); setRoomInput(""); setMessages([]);
+    setChatIn(""); setConnState("offline"); setStatusLine(""); setError(null);
+    setPeerId(""); setMsgCount(0); setPeerTyping(false); setShowHistory(false);
+    roomRef.current="";
+  };
+
+  const copyCode = async () => {
+    try{await navigator.clipboard.writeText(roomCode);}catch{}
+    setCopied(true); setTimeout(()=>setCopied(false), 2200);
+  };
+
+  const clearHistory = async (code) => {
+    await stSet(`msgs:${code}`, JSON.stringify([]));
+    if (roomRef.current===code) setMessages([]);
+  };
+
+  const deleteRoom = async (code) => {
+    setSavedRooms(prev=>{
+      const next=prev.filter(r=>r.code!==code);
+      stSet("room-list",JSON.stringify(next));
+      return next;
+    });
+    await stDel(`msgs:${code}`);
+    await stDel(`room:${code}:offer`,true);
+    await stDel(`room:${code}:answer`,true);
+  };
+
+  useEffect(()=>{ bottom.current?.scrollIntoView({behavior:"smooth"}); },[messages,peerTyping]);
+  useEffect(()=>()=>{clearInterval(pollRef.current);try{pcRef.current?.close();}catch{}},[]);
+
+  // ─────────────────────────────────────────────────────────────────
+  // FONT LOAD
+  // ─────────────────────────────────────────────────────────────────
+  useEffect(()=>{
+    const link=document.createElement("link");
+    link.rel="stylesheet";
+    link.href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600&display=swap";
+    document.head.appendChild(link);
+    const s=document.createElement("style");
+    s.textContent=`
+      *{box-sizing:border-box;margin:0;padding:0}
+      html,body,#root{height:100%;background:#06080e}
+      ::-webkit-scrollbar{width:4px;height:4px}
+      ::-webkit-scrollbar-track{background:transparent}
+      ::-webkit-scrollbar-thumb{background:#1c2340;border-radius:4px}
+      ::-webkit-scrollbar-thumb:hover{background:#2e3d6a}
+      textarea,input,button{font-family:'JetBrains Mono','Fira Code',monospace!important}
+      textarea:focus,input:focus{outline:none}
+      textarea{resize:none}
+      @keyframes fadeUp{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+      @keyframes spin{to{transform:rotate(360deg)}}
+      @keyframes blink{0%,49%{opacity:1}50%,100%{opacity:0}}
+      @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+      @keyframes shimmer{0%{opacity:0.5}50%{opacity:1}100%{opacity:0.5}}
+      @keyframes borderPulse{0%,100%{border-color:#1c2340}50%{border-color:#2e3d6a}}
+      .msg{animation:fadeUp 0.15s ease forwards}
+      .spin{animation:spin 1s linear infinite;display:inline-block}
+      .blink{animation:blink 1s step-end infinite}
+      .pulse{animation:pulse 2s ease-in-out infinite}
+      .shimmer{animation:shimmer 2.5s ease-in-out infinite}
+      .bgPulse{animation:borderPulse 2s ease-in-out infinite}
+    `;
+    document.head.appendChild(s);
+    return ()=>{ document.head.removeChild(link); document.head.removeChild(s); };
+  },[]);
+
+  // ─────────────────────────────────────────────────────────────────
+  // SHARED LAYOUT PIECES
+  // ─────────────────────────────────────────────────────────────────
+  const statusDot = {
+    offline:{col:C.muted, glow:"none", label:"OFFLINE"},
+    connected:{col:C.green, glow:`0 0 8px ${C.green}88`, label:"LIVE"},
+    disconnected:{col:C.red, glow:"none", label:"DISCONNECTED"},
+    error:{col:C.red, glow:"none", label:"ERROR"},
+    waiting:{col:C.cyan, glow:`0 0 8px ${C.cyan}66`, label:"WAITING"},
+  }[connState]||{col:C.muted, glow:"none", label:connState.toUpperCase()};
+
+  const Topbar = ({title, showBack=false}) => (
+    <div style={{
+      display:"flex",alignItems:"center",justifyContent:"space-between",
+      padding:"0 20px",height:48,
+      borderBottom:`1px solid ${C.border}`,background:C.surface,
+      flexShrink:0,gap:12,
+    }}>
+      <div style={{display:"flex",alignItems:"center",gap:14}}>
+        {showBack&&(
+          <button onClick={reset} style={{
+            background:"none",border:"none",color:C.muted,cursor:"pointer",
+            fontSize:16,padding:"4px 2px",lineHeight:1,
+          }}>←</button>
+        )}
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{...mono,fontSize:11,fontWeight:700,color:C.blue,letterSpacing:"0.2em"}}>◈</span>
+          <span style={{...mono,fontSize:11,fontWeight:700,color:C.white,letterSpacing:"0.12em"}}>{title||"CIPHER·LINK"}</span>
+        </div>
+        {roomCode&&(
+          <div style={{...mono,...pill(C.blue,C.blueDim),gap:6,cursor:"pointer"}} onClick={copyCode}>
+            <span style={{color:C.muted,fontSize:8}}>ROOM</span>
+            <span style={{letterSpacing:"0.2em"}}>{roomCode}</span>
+            <span style={{color:C.muted,fontSize:8}}>{copied?"✓":"⎘"}</span>
+          </div>
+        )}
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:12}}>
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <div style={{width:7,height:7,borderRadius:"50%",background:statusDot.col,boxShadow:statusDot.glow}}/>
+          <span style={{...mono,fontSize:8,color:statusDot.col,letterSpacing:"0.1em"}}>{statusDot.label}</span>
+        </div>
+        {phase==="chat"&&(
+          <button onClick={reset} style={{
+            ...mono,background:"none",border:`1px solid ${C.border}`,
+            color:C.muted,fontSize:9,padding:"4px 10px",cursor:"pointer",letterSpacing:"0.08em",
+          }}>LEAVE</button>
+        )}
+      </div>
+    </div>
+  );
+
+  const ErrBox = () => error ? (
+    <div style={{
+      ...mono,background:C.redDim,border:`1px solid ${C.red}44`,color:C.red,
+      fontSize:10,padding:"9px 14px",borderRadius:4,marginBottom:14,lineHeight:1.6,
+    }}>✗ {error}</div>
+  ) : null;
+
+  // ─────────────────────────────────────────────────────────────────
+  // LANDING VIEW
+  // ─────────────────────────────────────────────────────────────────
+  const LandingView = () => (
+    <div style={{flex:1,overflowY:"auto",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"flex-start",padding:"40px 20px"}}>
+      {/* Hero */}
+      <div style={{textAlign:"center",marginBottom:40,maxWidth:480}}>
+        <div style={{...mono,fontSize:32,fontWeight:700,color:C.white,letterSpacing:"0.18em",marginBottom:8,
+          textShadow:`0 0 40px ${C.blue}44`}}>CIPHER·LINK</div>
+        <div style={{...sans,fontSize:13,color:C.muted,lineHeight:1.7}}>
+          Browser-to-browser encrypted messaging.<br/>
+          Share a room code — no accounts, no servers, no logs.
+        </div>
+      </div>
+
+      <ErrBox/>
+
+      {/* Action cards */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,width:"100%",maxWidth:520,marginBottom:32}}>
+        {/* Create */}
+        <button onClick={createRoom} style={{
+          background:C.surfaceAlt,border:`1px solid ${C.borderHi}`,
+          borderRadius:8,padding:"22px 18px",cursor:"pointer",textAlign:"left",
+          transition:"border-color 0.15s",
+        }}
+          onMouseEnter={e=>e.currentTarget.style.borderColor=C.blue}
+          onMouseLeave={e=>e.currentTarget.style.borderColor=C.borderHi}
+        >
+          <div style={{...mono,fontSize:22,color:C.blue,marginBottom:8}}>+</div>
+          <div style={{...sans,fontSize:14,fontWeight:600,color:C.white,marginBottom:4}}>New Room</div>
+          <div style={{...sans,fontSize:11,color:C.muted,lineHeight:1.6}}>
+            Generate a room code and share it with your contact
+          </div>
+        </button>
+        {/* Join */}
+        <div style={{
+          background:C.surfaceAlt,border:`1px solid ${C.border}`,
+          borderRadius:8,padding:"22px 18px",
+        }}>
+          <div style={{...mono,fontSize:22,color:C.cyan,marginBottom:8}}>→</div>
+          <div style={{...sans,fontSize:14,fontWeight:600,color:C.white,marginBottom:8}}>Join Room</div>
+          <input
+            value={roomInput}
+            onChange={e=>{ setRoomInput(e.target.value.toUpperCase().replace(/[^A-Z2-9]/g,"")); setError(null); }}
+            onKeyDown={e=>{ if(e.key==="Enter") joinRoom(); }}
+            placeholder="ROOM CODE"
+            maxLength={8}
+            style={{
+              ...mono,width:"100%",background:"#060810",border:`1px solid ${C.border}`,
+              color:C.cyan,fontSize:13,padding:"7px 10px",borderRadius:4,
+              marginBottom:8,letterSpacing:"0.18em",
+            }}
+          />
+          <button onClick={()=>joinRoom()} disabled={!roomInput.trim()} style={{
+            ...mono,width:"100%",background:roomInput.trim()?C.blue:"transparent",
+            border:`1px solid ${roomInput.trim()?C.blue:C.border}`,
+            color:roomInput.trim()?"#000":C.dim,fontSize:10,padding:"7px",
+            cursor:roomInput.trim()?"pointer":"not-allowed",letterSpacing:"0.1em",
+            borderRadius:4, fontWeight:700,
+          }}>JOIN →</button>
+        </div>
+      </div>
+
+      {/* Saved rooms */}
+      {savedRooms.length>0&&(
+        <div style={{width:"100%",maxWidth:520}}>
+          <button
+            onClick={()=>setShowHistory(h=>!h)}
+            style={{
+              ...mono,background:"none",border:"none",color:C.muted,fontSize:10,
+              cursor:"pointer",letterSpacing:"0.1em",marginBottom:10,
+              display:"flex",alignItems:"center",gap:8,
+            }}
+          >
+            <span>{showHistory?"▼":"▶"}</span>
+            <span>SAVED ROOMS ({savedRooms.length})</span>
+          </button>
+          {showHistory&&(
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {[...savedRooms].reverse().map(r=>(
+                <div key={r.code} style={{
+                  display:"flex",alignItems:"center",gap:10,
+                  background:C.surface,border:`1px solid ${C.border}`,
+                  borderRadius:6,padding:"9px 12px",
+                }}>
+                  <span style={{...mono,fontSize:13,fontWeight:700,color:C.blue,letterSpacing:"0.15em",flex:1}}>{r.code}</span>
+                  <span style={{...mono,fontSize:8,color:C.muted,...pill(r.role==="host"?C.blue:C.cyan, r.role==="host"?C.blueDim:C.cyanDim)}}>{r.role}</span>
+                  <span style={{...mono,fontSize:8,color:C.dim}}>{new Date(r.lastSeen).toLocaleDateString()}</span>
+                  <button onClick={()=>joinRoom(r.code)} style={{
+                    ...mono,background:C.blue,color:"#000",border:"none",
+                    fontSize:9,padding:"4px 10px",cursor:"pointer",borderRadius:3,fontWeight:700,
+                  }}>REJOIN</button>
+                  <button onClick={()=>clearHistory(r.code)} title="Clear messages" style={{
+                    background:"none",border:`1px solid ${C.border}`,color:C.muted,
+                    fontSize:9,padding:"3px 7px",cursor:"pointer",borderRadius:3,...mono,
+                  }}>🗑 MSGS</button>
+                  <button onClick={()=>deleteRoom(r.code)} title="Remove room" style={{
+                    background:"none",border:`1px solid ${C.redDim}`,color:C.red,
+                    fontSize:9,padding:"3px 7px",cursor:"pointer",borderRadius:3,...mono,
+                  }}>✕</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Footer tech */}
+      <div style={{marginTop:"auto",paddingTop:40,textAlign:"center"}}>
+        <div style={{display:"flex",gap:20,justifyContent:"center",flexWrap:"wrap"}}>
+          {["WebRTC DataChannels","PBKDF2 + AES-256-GCM","STUN NAT Traversal","No account needed","Messages saved locally"].map(t=>(
+            <span key={t} style={{...mono,fontSize:8,color:C.dim,letterSpacing:"0.07em"}}>◆ {t}</span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+
+  // ─────────────────────────────────────────────────────────────────
+  // CREATING / JOINING / WAITING
+  // ─────────────────────────────────────────────────────────────────
+  const TransitionView = () => (
+    <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:20,padding:24}}>
+      <div style={{fontSize:28,color:C.blue}} className="spin">◈</div>
+      <div style={{...mono,fontSize:11,color:C.white,letterSpacing:"0.08em"}}>{statusLine}</div>
+
+      {phase==="waiting"&&roomCode&&(
+        <div style={{
+          background:C.surfaceAlt,border:`1px solid ${C.borderHi}`,
+          borderRadius:10,padding:"24px 32px",textAlign:"center",
+          maxWidth:360,width:"100%",
+        }} className="bgPulse">
+          <div style={{...sans,fontSize:12,color:C.muted,marginBottom:12,letterSpacing:"0.05em"}}>
+            Share this code with your contact
+          </div>
+          <div style={{
+            ...mono,fontSize:36,fontWeight:700,color:C.blue,letterSpacing:"0.35em",
+            marginBottom:16,textShadow:`0 0 30px ${C.blue}55`,
+          }}>{roomCode}</div>
+          <button onClick={copyCode} style={{
+            ...mono,background:copied?C.green:C.blue,color:"#000",
+            border:"none",padding:"10px 28px",fontSize:11,
+            fontWeight:700,letterSpacing:"0.12em",cursor:"pointer",borderRadius:4,
+            transition:"all 0.2s",
+          }}>
+            {copied?"✓ COPIED":"⎘ COPY CODE"}
+          </button>
+          <div style={{...sans,fontSize:10,color:C.muted,marginTop:12,lineHeight:1.7}}>
+            Both peers connect directly.<br/>
+            Waiting for peer to enter this code…
+          </div>
+        </div>
+      )}
+
+      {phase==="joining"&&(
+        <div style={{...mono,fontSize:10,color:C.muted,letterSpacing:"0.07em"}} className="pulse">
+          Establishing encrypted tunnel to room <span style={{color:C.cyan}}>{roomCode}</span>…
+        </div>
+      )}
+
+      <button onClick={reset} style={{
+        ...mono,background:"none",border:`1px solid ${C.border}`,color:C.muted,
+        fontSize:9,padding:"7px 18px",cursor:"pointer",letterSpacing:"0.09em",marginTop:8,
+      }}>CANCEL</button>
+    </div>
+  );
+
+  // ─────────────────────────────────────────────────────────────────
+  // CHAT VIEW
+  // ─────────────────────────────────────────────────────────────────
+  const MsgRow = ({m}) => {
+    if (m.from==="sys") return (
+      <div className="msg" style={{
+        textAlign:"center",...mono,fontSize:9,color:C.sys,
+        padding:"4px 0",letterSpacing:"0.06em",fontStyle:"italic",
+      }}>── {m.text} ──</div>
+    );
+    const isMe = m.from==="me";
+    return (
+      <div className="msg" style={{
+        display:"flex",flexDirection:"column",
+        alignItems:isMe?"flex-end":"flex-start",gap:3,
+      }}>
+        <div style={{display:"flex",alignItems:"center",gap:8,...mono,fontSize:8,color:C.muted}}>
+          <span style={{color:isMe?C.blue:C.cyan}}>{isMe?`${myNode} (you)`:peerId||"peer"}</span>
+          <span>{fmtDate(m.ts)}</span>
+          {isMe&&<span style={{color:C.greenDim,fontSize:7}}>✓ E2E</span>}
+        </div>
+        <div style={{
+          maxWidth:"74%",padding:"9px 13px",
+          background:isMe?"#0d1530":"#0a1008",
+          border:`1px solid ${isMe?C.blueDim:"#1a3018"}`,
+          borderRadius:isMe?"10px 10px 2px 10px":"10px 10px 10px 2px",
+          color:isMe?"#b0c8ff":"#90c080",
+          fontSize:13,lineHeight:1.65,wordBreak:"break-word",...sans,
+        }}>{m.text}</div>
+      </div>
+    );
+  };
+
+  const ChatView = () => (
+    <div style={{flex:1,display:"flex",flexDirection:"column",minHeight:0}}>
+      {/* Info strip */}
+      <div style={{
+        borderBottom:`1px solid ${C.border}`,padding:"5px 16px",
+        background:"#090c16",flexShrink:0,
+        display:"flex",alignItems:"center",flexWrap:"wrap",gap:12,
+      }}>
+        <div style={{display:"flex",alignItems:"center",gap:6,...mono,fontSize:8,color:C.muted}}>
+          <span>PEER</span>
+          <span style={{color:C.white,fontWeight:600}}>{peerId||"—"}</span>
+        </div>
+        <span style={{color:C.border,...mono,fontSize:8}}>│</span>
+        <span style={{...mono,...pill(C.green,C.greenDim),fontSize:8}}>🔒 AES-256-GCM</span>
+        <span style={{color:C.border,...mono,fontSize:8}}>│</span>
+        <span style={{...mono,fontSize:8,color:C.muted}}>{msgCount} messages</span>
+        <div style={{marginLeft:"auto",display:"flex",gap:8}}>
+          <button onClick={()=>clearHistory(roomCode)} style={{
+            ...mono,background:"none",border:`1px solid ${C.border}`,color:C.muted,
+            fontSize:8,padding:"3px 8px",cursor:"pointer",borderRadius:3,
+          }} title="Clear message history">🗑 CLEAR</button>
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div style={{flex:1,overflowY:"auto",padding:"14px 16px",display:"flex",flexDirection:"column",gap:6}}>
+        {messages.length===0&&(
+          <div style={{textAlign:"center",...mono,color:C.dim,fontSize:10,marginTop:60,lineHeight:2}}>
+            Channel open.<br/>
+            <span style={{fontSize:9,color:C.sys}}>Messages encrypted and saved across sessions.</span>
+          </div>
+        )}
+        {messages.map(m=><MsgRow key={m.id} m={m}/>)}
+        {peerTyping&&(
+          <div style={{...mono,fontSize:9,color:C.muted,fontStyle:"italic"}} className="pulse">
+            {peerId||"Peer"} is typing<span className="blink">_</span>
+          </div>
+        )}
+        <div ref={bottom}/>
+      </div>
+
+      {/* Compose */}
+      <div style={{borderTop:`1px solid ${C.border}`,padding:"10px 14px",background:C.surface,flexShrink:0}}>
+        <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
+          <textarea
+            ref={chatRef} rows={2} value={chatIn}
+            onChange={e=>{setChatIn(e.target.value);sendTyping();}}
+            onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMsg();}}}
+            placeholder="Type a message… (Enter to send · Shift+Enter for newline)"
+            maxLength={2000}
+            style={{
+              ...sans,flex:1,background:"#050811",border:`1px solid ${C.borderHi}`,
+              color:C.white,fontSize:13,padding:"8px 11px",lineHeight:1.5,borderRadius:5,
+            }}
+          />
+          <button
+            onClick={sendMsg} disabled={!chatIn.trim()}
+            style={{
+              ...mono,background:chatIn.trim()?C.blue:"transparent",
+              border:`1px solid ${chatIn.trim()?C.blue:C.border}`,
+              color:chatIn.trim()?"#000":C.dim,
+              fontSize:11,fontWeight:700,padding:"8px 16px",flexShrink:0,
+              cursor:chatIn.trim()?"pointer":"not-allowed",borderRadius:5,
+              transition:"all 0.15s",letterSpacing:"0.08em",
+            }}
+          >SEND</button>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between",marginTop:5,...mono,fontSize:8,color:C.dim}}>
+          <span>ENTER send · SHIFT+ENTER newline</span>
+          <span style={{color:chatIn.length>1800?C.red:C.dim}}>{chatIn.length}/2000</span>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ─────────────────────────────────────────────────────────────────
+  // ROOT
+  // ─────────────────────────────────────────────────────────────────
+  const title = phase==="chat"
+    ? `Room ${roomCode}`
+    : phase==="waiting"
+    ? `Waiting · ${roomCode}`
+    : "CIPHER·LINK";
+
+  return (
+    <div style={{
+      height:"100vh",display:"flex",flexDirection:"column",
+      background:C.bg,color:C.white,overflow:"hidden",
+      fontFamily:"'Inter','Segoe UI',system-ui,sans-serif",
+    }}>
+      <Topbar title={title} showBack={phase!=="landing"&&phase!=="chat"}/>
+
+      {phase==="landing"&&<LandingView/>}
+      {(phase==="creating"||phase==="waiting"||phase==="joining")&&<TransitionView/>}
+      {phase==="chat"&&<ChatView/>}
+
+      {/* Footer */}
+      <div style={{
+        ...mono,borderTop:`1px solid ${C.border}`,padding:"3px 16px",
+        background:"#050711",fontSize:8,color:C.dim,
+        display:"flex",justifyContent:"space-between",flexShrink:0,letterSpacing:"0.08em",
+      }}>
+        <span>CIPHER·LINK v3 · Node {myNode}</span>
+        <span>WebRTC · PBKDF2 · AES-256-GCM · No servers · Saved locally</span>
+      </div>
+    </div>
+  );
+}
